@@ -1,0 +1,30 @@
+defaults:
+  - model_checkpoint
+  - early_stopping
+  - learning_rate_monitor
+  - model_summary
+  - rich_progress_bar
+  - _self_
+
+model_checkpoint:
+  dirpath: ${paths.output_dir}/checkpoints
+  filename: "epoch_{epoch:03d}-bpd_{val/bpd:.4f}"
+  monitor: "val/bpd"
+  mode: "min"
+  save_top_k: 3
+  save_last: True
+  auto_insert_metric_name: False
+
+early_stopping:
+  monitor: "val/bpd"
+  patience: 15
+  mode: "min"
+
+visualization:
+  _target_: src.callbacks.glow_visualization.GlowVisualizationCallback
+  num_samples: 36
+  temperature: 0.7
+  log_every_n_epochs: 5
+
+model_summary:
+  max_depth: -1

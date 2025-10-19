@@ -1,0 +1,21 @@
+enabled: true
+
+bridge: ${model.bridge}
+
+density:
+  optimizer: ${model.optimizer}
+  scheduler: ${model.scheduler}
+  module:
+    log_train_metrics: ${model.log_train_metrics}
+
+dynamics:
+  optimizer: ${model.optimizer}
+  scheduler: ${model.scheduler}
+  module:
+    lambda_dynamics: ${model.lambda_dynamics}
+    lambda_path: ${model.lambda_path}
+    log_train_metrics: ${model.log_train_metrics}
+    freeze_density: true
+
+density_epochs: ${model.density_phase_epochs}
+dynamics_epochs: ${trainer.max_epochs}

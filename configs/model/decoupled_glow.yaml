@@ -1,0 +1,26 @@
+_target_: src.models.decoupled_glow_module.DecoupledGlowLitModule
+
+bridge:
+  _target_: src.models.components.decoupled_glow.DecoupledBridge
+  data_dim: 1024              # override per dataset if needed
+  hidden_size: 64
+  resolution: 32
+  n_blocks_flow: 2
+  num_scales: 2
+  T: ${data.T}
+  sigma_reverse: 0.5
+  training_noise_std: 0.0001
+  score_clamp_norm: 100.0
+
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 0.001
+  weight_decay: 0.0
+
+scheduler: null
+
+lambda_dynamics: 1.0
+lambda_path: 0.0
+log_train_metrics: true
+density_phase_epochs: 100

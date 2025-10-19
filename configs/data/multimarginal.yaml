@@ -1,0 +1,33 @@
+# Configuration for the MultiMarginalDataModule
+_target_: src.data.multimarginal_datamodule.MultiMarginalDataModule
+
+# General settings
+data_dir: ${paths.data_dir}
+data_type: grf  # options: grf, spiral
+batch_size: 64
+dynamics_batch_size: null
+val_split: 0.1
+num_workers: 0
+pin_memory: false
+
+# Shared temporal configuration
+T: 1.0
+n_constraints: 5
+
+# GRF-specific hyperparameters
+n_samples: 1024
+resolution: 32
+L_domain: 1.0
+micro_corr_length: 0.1
+H_max_factor: 0.5
+mean_val: 10.0
+std_val: 2.0
+covariance_type: gaussian
+generation_method: fft
+kl_error_threshold: 0.001
+schedule_type: geometric
+
+# Spiral-specific hyperparameters
+spiral_data_dim: 3
+spiral_samples_per_marginal: 512
+spiral_noise_std: 0.1

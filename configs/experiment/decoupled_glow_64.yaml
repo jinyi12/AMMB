@@ -1,0 +1,89 @@
+# @package _global_
+
+# Run with: python train.py experiment=decoupled_glow
+
+defaults:
+  - override /data: multimarginal
+  - override /model: decoupled_glow
+  - override /callbacks: default
+  - override /trainer: default
+  - override /logger: wandb
+  - override /sequential: decoupled_glow
+
+name: "glow_decoupled_base"
+tags: ["glow", "decoupled", "multimarginal"]
+seed: 42
+
+trainer:
+  max_epochs: 500
+  gradient_clip_val: 0
+  precision: 16-mixed
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 50
+
+callbacks:
+  visualization: null
+  model_checkpoint:
+    monitor: "val/loss"
+    mode: "min"
+    filename: "epoch_{epoch:03d}"
+    save_top_k: 1
+    save_last: True
+    auto_insert_metric_name: True
+  early_stopping:
+    monitor: "val/loss"
+    mode: "min"
+    patience: 25
+  learning_rate_monitor:
+    logging_interval: epoch
+  model_summary:
+    max_depth: -1
+  rich_progress_bar: {}
+  decoupled_bridge_visualization:
+    _target_: src.callbacks.glow_visualization.DecoupledBridgeVisualizationCallback
+    num_samples: 16
+    log_every_n_epochs: 50
+
+model:
+  bridge:
+    data_dim: ${eval:${data.resolution} * ${data.resolution}}
+    resolution: ${data.resolution}
+    hidden_size: 128
+    n_blocks_flow: 3
+    num_scales: 2
+  optimizer:
+    lr: 0.001
+  lambda_dynamics: 1.0
+  lambda_path: 0.0
+  log_train_metrics: true
+  density_phase_epochs: 500
+  dynamics_phase_epochs: 500
+
+
+data:
+  batch_size: 64
+  dynamics_batch_size: 64
+  n_samples: 512
+  resolution: 64
+  val_split: 0.1
+  # GRF-specific hyperparameters
+  data_type: grf
+  T: 1.0
+  n_constraints: 5
+  L_domain: 1.0
+  micro_corr_length: 0.05
+  H_max_factor: 0.8
+  mean_val: 10.0
+  std_val: 2.0
+  covariance_type: exponential
+  generation_method: kl
+  kl_error_threshold: 0.001
+  schedule_type: geometric
+
+logger:
+  wandb:
+    project: "AMMB"
+    name: ${name}
+    tags: ${tags}
+
+optimized_metric: "val/loss"

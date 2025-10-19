@@ -1,0 +1,22 @@
+_target_: src.models.glow_module.GlowLitModule
+
+input_dims: [1, 32, 32]
+
+net:
+  _target_: src.models.components.glow_network.GlowNetwork
+  input_dims: ${model.input_dims}
+  hidden_size: 128
+  n_blocks_flow: 3
+  num_scales: 2
+
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 0.0005
+  weight_decay: 0.0
+
+scheduler: null
+
+eval_batch_size: 64
+eval_temperature: 1.0
+log_train_metrics: true
