@@ -156,6 +156,22 @@ def _train_decoupled_sequential(
 
     bridge = hydra.utils.instantiate(bridge_cfg)
 
+    if hasattr(datamodule, "setup"):
+        datamodule.setup(stage="fit")
+
+    data_mean = getattr(datamodule, "data_mean", None)
+    data_std = getattr(datamodule, "data_std", None)
+    if data_mean is None or data_std is None:
+        raise RuntimeError(
+            "Sequential training requires the datamodule to expose data_mean and data_std after setup()."
+        )
+
+    constraint_times = getattr(datamodule, "constraint_times", None)
+    if constraint_times is None:
+        raise RuntimeError(
+            "Sequential training requires the datamodule to expose constraint_times after setup()."
+        )
+
     density_optimizer_partial = hydra.utils.instantiate(density_cfg.optimizer)
     density_scheduler_partial = _maybe_instantiate(density_cfg.get("scheduler"))
     density_kwargs = _config_to_kwargs(density_cfg.get("module"))
@@ -163,6 +179,8 @@ def _train_decoupled_sequential(
         bridge=bridge,
         optimizer=density_optimizer_partial,
         scheduler=density_scheduler_partial,
+        data_mean=data_mean,
+        data_std=data_std,
         **density_kwargs,
     )
 
@@ -173,6 +191,9 @@ def _train_decoupled_sequential(
         bridge=bridge,
         optimizer=dynamics_optimizer_partial,
         scheduler=dynamics_scheduler_partial,
+        data_mean=data_mean,
+        data_std=data_std,
+        constraint_times=constraint_times,
         **dynamics_kwargs,
     )
 
