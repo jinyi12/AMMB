@@ -7,30 +7,49 @@ import torch.nn.functional as F
 from torch import Tensor
 from torchmetrics import MeanMetric
 
-from src.models.components.decoupled_glow import DecoupledBridge
+from src.models.components.decoupled_glow import TransportBridge
 from src.models.base_decoupled_module import BaseDecoupledLitModule
 
 
 class DecoupledDynamicsLitModule(BaseDecoupledLitModule):
     def __init__(
         self,
-        bridge: DecoupledBridge,
+        bridge: TransportBridge,
+        constraint_times: Tensor,
         optimizer: Any,
         scheduler: Optional[Any] = None,
         lambda_dynamics: float = 1.0,
         lambda_path: float = 0.0,
         log_train_metrics: bool = True,
         freeze_density: bool = True,
-        data_mean: Optional[Tensor] = None,
-        data_std: Optional[Tensor] = None,
-        constraint_times: Optional[Tensor] = None,
     ) -> None:
+        """Initialize dynamics training module with TransportBridge.
+        
+        This module receives a pre-trained TransportBridge with:
+        - DensityWrapper: pre-trained density model + normalization
+        - InvertibleNeuralFlow: dynamics model to be trained
+        
+        Freezing happens in __init__ because sequential orchestration ensures
+        density training is complete before this module is created.
+        
+        Args:
+            bridge: TransportBridge with pre-trained density and fresh dynamics
+            constraint_times: 1D tensor of constraint time points
+            optimizer: Optimizer factory (partial)
+            scheduler: Optional scheduler factory
+            lambda_dynamics: Weight for dynamics loss
+            lambda_path: Weight for path regularization
+            log_train_metrics: Whether to log training metrics
+            freeze_density: Whether to freeze density model (should be True)
+        """
         super().__init__(
-            bridge=bridge,
             optimizer=optimizer,
             scheduler=scheduler,
             log_train_metrics=log_train_metrics,
         )
+        
+        # Explicit dependency: transport bridge with both models
+        self.bridge = bridge
         self.lambda_dynamics = lambda_dynamics
         self.lambda_path = lambda_path
         self.freeze_density = freeze_density
@@ -50,63 +69,32 @@ class DecoupledDynamicsLitModule(BaseDecoupledLitModule):
         self.test_path = MeanMetric()
         self.test_density = MeanMetric()
 
-        self.register_buffer("_constraint_times", torch.empty(0), persistent=False)
-        self._constraint_times_set = False
-        self._normalization_synced = False
-        self._density_frozen = False
-
-        if (data_mean is None) != (data_std is None):
-            raise ValueError("Both data_mean and data_std must be provided together.")
-        if data_mean is not None and data_std is not None:
-            self.set_normalization(data_mean, data_std)
-
-        if constraint_times is not None:
-            self.set_constraint_times(constraint_times)
+        # Store constraint times immediately
+        if constraint_times.ndim != 1:
+            raise ValueError("constraint_times tensor must be 1D with monotonic entries.")
+        if constraint_times.numel() < 2:
+            raise ValueError("constraint_times must contain at least start and end times.")
+        self.register_buffer("_constraint_times", constraint_times.detach().clone(), persistent=False)
+        
+        # Freeze density model if requested (safe now that initialization is sequential)
+        if self.freeze_density:
+            self._freeze_density()
 
     @property
     def active_times(self) -> Tensor:
-        if not self._constraint_times_set:
-            raise RuntimeError("Constraint times are not set; call set_constraint_times() before training.")
+        """Return constraint times excluding t=0."""
         return self._constraint_times[1:]
 
-    def set_normalization(self, mean: Tensor, std: Tensor) -> None:
-        mean = mean.to(device=self.bridge.data_mean.device, dtype=self.bridge.data_mean.dtype)
-        std = std.to(device=self.bridge.data_std.device, dtype=self.bridge.data_std.dtype)
-        self.bridge.update_normalization(mean, std)
-        self._normalization_synced = True
-        # Don't freeze here - will freeze in on_fit_start() to avoid affecting density training
-
-    def set_constraint_times(self, times: Tensor) -> None:
-        times = times.to(device=self.bridge.data_mean.device, dtype=self.bridge.data_mean.dtype)
-        if times.ndim != 1:
-            raise ValueError("constraint_times tensor must be 1D with monotonic entries.")
-        if times.numel() < 2:
-            raise ValueError("constraint_times must contain at least start and end times.")
-        self._constraint_times = times.detach().clone()
-        self._constraint_times_set = True
-
-    def _ensure_metadata(self) -> None:
-        if not self._normalization_synced:
-            raise RuntimeError(
-                "Normalization statistics not provided; call set_normalization() before using the module."
-            )
-        if not self._constraint_times_set:
-            raise RuntimeError(
-                "Constraint times not provided; call set_constraint_times() before using the module."
-            )
-
-    def _maybe_freeze_density(self) -> None:
-        if self.freeze_density and not self._density_frozen and self._normalization_synced:
-            for param in self.bridge.density_model.parameters():
-                param.requires_grad = False
-            self.bridge.density_model.eval()
-            self._density_frozen = True
+    def _freeze_density(self) -> None:
+        """Freeze density model parameters and set to eval mode."""
+        for param in self.bridge.density.model.parameters():
+            param.requires_grad = False
+        self.bridge.density.model.eval()
 
     def forward(self, x0: Tensor, t: Tensor | float) -> Tensor:
         return self.bridge.transport(x0, t)
 
     def model_step(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
-        self._ensure_metadata()
         x0 = batch["x0"].view(batch["x0"].shape[0], -1)
         xt = batch.get("xt")
         if xt is not None:
@@ -184,11 +172,5 @@ class DecoupledDynamicsLitModule(BaseDecoupledLitModule):
         self.log("test/density", self.test_density, on_step=False, on_epoch=True)
 
     def get_optimized_parameters(self) -> Iterable:
-        dynamics_params = list(self.bridge.dynamics_model.parameters())
-        if self.freeze_density:
-            return dynamics_params
-        return dynamics_params + list(self.bridge.density_model.parameters())
-
-    def on_fit_start(self) -> None:  # type: ignore[override]
-        self._ensure_metadata()
-        self._maybe_freeze_density()
+        """Return only dynamics model parameters for optimization."""
+        return list(self.bridge.dynamics.parameters())

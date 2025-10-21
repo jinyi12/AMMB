@@ -27,6 +27,8 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 from src.models.decoupled_density_module import DecoupledDensityLitModule  # noqa: E402
 from src.models.decoupled_dynamics_module import DecoupledDynamicsLitModule  # noqa: E402
+from src.models.components.density_wrapper import DensityWrapper  # noqa: E402
+from src.models.components.decoupled_glow import TransportBridge  # noqa: E402
 from src.utils import (
     RankedLogger,
     extras,
@@ -141,6 +143,17 @@ def _train_decoupled_sequential(
     datamodule: LightningDataModule,
     sequential_cfg: DictConfig,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Sequential training with explicit dependency injection.
+    
+    This orchestrator follows best practices:
+    1. Instantiates models independently (not via shared bridge)
+    2. Initializes density module first
+    3. Trains density phase
+    4. Only THEN initializes dynamics module (after density training complete)
+    5. Trains dynamics phase with frozen density
+    
+    This eliminates shared mutable state issues.
+    """
     if cfg.get("ckpt_path"):
         raise NotImplementedError("Sequential training does not yet support resuming from checkpoints.")
 
@@ -154,8 +167,7 @@ def _train_decoupled_sequential(
     if dynamics_cfg is None or dynamics_cfg.get("optimizer") is None:
         raise ValueError("Sequential dynamics configuration must define an optimizer.")
 
-    bridge = hydra.utils.instantiate(bridge_cfg)
-
+    # Setup datamodule to get metadata
     if hasattr(datamodule, "setup"):
         datamodule.setup(stage="fit")
 
@@ -172,30 +184,19 @@ def _train_decoupled_sequential(
             "Sequential training requires the datamodule to expose constraint_times after setup()."
         )
 
-    density_optimizer_partial = hydra.utils.instantiate(density_cfg.optimizer)
-    density_scheduler_partial = _maybe_instantiate(density_cfg.get("scheduler"))
-    density_kwargs = _config_to_kwargs(density_cfg.get("module"))
-    density_module = DecoupledDensityLitModule(
-        bridge=bridge,
-        optimizer=density_optimizer_partial,
-        scheduler=density_scheduler_partial,
-        data_mean=data_mean,
-        data_std=data_std,
-        **density_kwargs,
-    )
-
-    dynamics_optimizer_partial = hydra.utils.instantiate(dynamics_cfg.optimizer)
-    dynamics_scheduler_partial = _maybe_instantiate(dynamics_cfg.get("scheduler"))
-    dynamics_kwargs = _config_to_kwargs(dynamics_cfg.get("module"))
-    dynamics_module = DecoupledDynamicsLitModule(
-        bridge=bridge,
-        optimizer=dynamics_optimizer_partial,
-        scheduler=dynamics_scheduler_partial,
-        data_mean=data_mean,
-        data_std=data_std,
-        constraint_times=constraint_times,
-        **dynamics_kwargs,
-    )
+    # Step 1: Instantiate models independently (dependency injection preparation)
+    log.info("Instantiating density and dynamics models independently.")
+    density_model_cfg = bridge_cfg.get("density_model")
+    dynamics_model_cfg = bridge_cfg.get("dynamics_model")
+    
+    if density_model_cfg is None or dynamics_model_cfg is None:
+        raise ValueError("Bridge config must define density_model and dynamics_model sub-configs.")
+    
+    density_model = hydra.utils.instantiate(density_model_cfg)
+    dynamics_model = hydra.utils.instantiate(dynamics_model_cfg)
+    
+    # Extract bridge parameters
+    bridge_params = _config_to_kwargs(bridge_cfg.get("params", {}))
 
     density_epochs = int(sequential_cfg.get("density_epochs", 0))
     dynamics_epochs = sequential_cfg.get("dynamics_epochs")
@@ -204,11 +205,38 @@ def _train_decoupled_sequential(
 
     density_metrics: Dict[str, Any] = {}
     density_trainer: Optional[Trainer] = None
+    density_module: Optional[DecoupledDensityLitModule] = None
 
+    # Step 2: Density Phase - Initialize and Train
     if cfg.get("train") and density_epochs > 0:
         log.info("Starting density phase training.")
         if hasattr(datamodule, "set_training_phase"):
             datamodule.set_training_phase("density")
+        
+        density_optimizer_partial = hydra.utils.instantiate(density_cfg.optimizer)
+        density_scheduler_partial = _maybe_instantiate(density_cfg.get("scheduler"))
+        density_kwargs = _config_to_kwargs(density_cfg.get("module"))
+        
+        # Create DensityWrapper with normalization statistics
+        # NOTE: Data from datamodule is already normalized: z = (x - data_mean) / data_std
+        # DensityWrapper receives normalized data and computes log prob in z-space
+        # data_mean and data_std are stored ONLY for visualization denormalization
+        density_wrapper = DensityWrapper(
+            density_model=density_model,
+            resolution=bridge_params.get("resolution"),
+            data_mean=data_mean,           # Original data normalization mean
+            data_std=data_std,             # Original data normalization std
+            training_noise_std=bridge_params.get("training_noise_std", 1e-4),
+        )
+        
+        # Inject wrapper into density module
+        density_module = DecoupledDensityLitModule(
+            density_wrapper=density_wrapper,
+            optimizer=density_optimizer_partial,
+            scheduler=density_scheduler_partial,
+            **density_kwargs,
+        )
+        
         density_callbacks = instantiate_callbacks(cfg.get("callbacks"))
         density_trainer = hydra.utils.instantiate(
             cfg.trainer,
@@ -218,10 +246,48 @@ def _train_decoupled_sequential(
         )
         density_trainer.fit(density_module, datamodule=datamodule)
         density_metrics = {f"density/{k}": v for k, v in dict(density_trainer.callback_metrics).items()}
+    else:
+        # If not training density, still create wrapper with untrained model
+        # Normalization statistics still needed for visualization
+        density_wrapper = DensityWrapper(
+            density_model=density_model,
+            resolution=bridge_params.get("resolution"),
+            data_mean=data_mean,
+            data_std=data_std,
+            training_noise_std=bridge_params.get("training_noise_std", 1e-4),
+        )
+    
+    # Density model is now trained (density_model parameters updated via wrapper)
 
+    # Step 3: Dynamics Phase - Initialize and Train
+    # Critical: dynamics module only initialized AFTER density training complete
     if hasattr(datamodule, "set_training_phase"):
         datamodule.set_training_phase("dynamics")
 
+    log.info("Starting dynamics phase initialization.")
+    dynamics_optimizer_partial = hydra.utils.instantiate(dynamics_cfg.optimizer)
+    dynamics_scheduler_partial = _maybe_instantiate(dynamics_cfg.get("scheduler"))
+    dynamics_kwargs = _config_to_kwargs(dynamics_cfg.get("module"))
+    
+    # Create TransportBridge with trained DensityWrapper and fresh dynamics model
+    # Freezing will happen in module __init__ (safe because density training complete)
+    # Note: training_noise_std is density-specific, not passed to TransportBridge
+    transport_bridge_params = {k: v for k, v in bridge_params.items() if k != 'training_noise_std'}
+    transport_bridge = TransportBridge(
+        density_wrapper=density_wrapper,
+        dynamics_model=dynamics_model,
+        **transport_bridge_params,
+    )
+    
+    # Inject TransportBridge into dynamics module
+    dynamics_module = DecoupledDynamicsLitModule(
+        bridge=transport_bridge,
+        constraint_times=constraint_times,
+        optimizer=dynamics_optimizer_partial,
+        scheduler=dynamics_scheduler_partial,
+        **dynamics_kwargs,
+    )
+    
     logger_instances: List[Logger] = instantiate_loggers(cfg.get("logger"))
     dynamics_callbacks = instantiate_callbacks(cfg.get("callbacks"))
     dynamics_trainer = hydra.utils.instantiate(

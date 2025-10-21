@@ -15,7 +15,7 @@ tags: ["glow", "decoupled", "multimarginal"]
 seed: 42
 
 trainer:
-  max_epochs: 500
+  max_epochs: 100
   gradient_clip_val: 0
   precision: 16-mixed
   log_every_n_steps: 10
@@ -46,18 +46,32 @@ callbacks:
 
 model:
   bridge:
-    data_dim: ${eval:${data.resolution} * ${data.resolution}}
-    resolution: ${data.resolution}
-    hidden_size: 128
-    n_blocks_flow: 3
-    num_scales: 2
+    density_model:
+      input_shape:
+        - 1
+        - ${data.resolution}
+        - ${data.resolution}
+      hidden_dim: 128
+      n_blocks_flow: 3
+      num_scales: 2
+    dynamics_model:
+      input_shape:
+        - 1
+        - ${data.resolution}
+        - ${data.resolution}
+      hidden_dim: 128
+      n_blocks_flow: 3
+      num_scales: 2
+    params:
+      data_dim: ${eval:${data.resolution} * ${data.resolution}}
+      resolution: ${data.resolution}
   optimizer:
     lr: 0.001
   lambda_dynamics: 1.0
   lambda_path: 0.0
   log_train_metrics: true
-  density_phase_epochs: 500
-  dynamics_phase_epochs: 500
+  density_phase_epochs: 100
+  dynamics_phase_epochs: 100
 
 
 data:

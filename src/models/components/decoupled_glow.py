@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Tuple
+from typing import Any, Iterable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -223,67 +223,55 @@ class DecoupledBridgeConfig:
     score_clamp_norm: float = 100.0
 
 
-class DecoupledBridge(nn.Module):
-    """Container wrapping the density (G_phi) and dynamics (T_theta) models."""
+class TransportBridge(nn.Module):
+    """Focused bridge for transport operations integrating density and dynamics models.
+    
+    This bridge encapsulates the complex interactions required for transport between
+    the initial marginal (density) and the dynamics. It receives a pre-trained
+    DensityWrapper and a dynamics model via dependency injection.
+    
+    By accepting a DensityWrapper rather than raw models, this bridge respects
+    separation of concerns: density training is isolated in its own phase, and
+    this bridge only coordinates the transport operations needed for dynamics.
+    """
 
     def __init__(
         self,
+        density_wrapper: Any,  # DensityWrapper - pre-trained with normalization
+        dynamics_model: nn.Module,
         data_dim: int,
-        hidden_size: int,
         resolution: int,
-        n_blocks_flow: int = 2,
-        num_scales: int = 2,
         T: float = 1.0,
         sigma_reverse: float = 0.5,
-        data_mean: Optional[Tensor] = None,
-        data_std: Optional[Tensor] = None,
-        training_noise_std: float = 1e-4,
         score_clamp_norm: float = 100.0,
     ) -> None:
+        """Initialize TransportBridge with pre-trained density and dynamics model.
+        
+        Args:
+            density_wrapper: DensityWrapper instance (pre-trained, contains normalization stats)
+            dynamics_model: Pre-instantiated InvertibleNeuralFlow model
+            data_dim: Dimensionality of flattened data
+            resolution: Spatial resolution (assumes square images)
+            T: Terminal time for dynamics
+            sigma_reverse: Diffusion coefficient for reverse SDE
+            score_clamp_norm: Maximum gradient norm for score function
+        """
         super().__init__()
+        # Dependency injection: accept components rather than creating them
+        self.density = density_wrapper  # DensityWrapper with trained density_model
+        self.dynamics = dynamics_model
+        
         self.data_dim = data_dim
         self.resolution = resolution
         self.T = T
         self.sigma_reverse = sigma_reverse
-        self.training_noise_std = training_noise_std
         self.score_clamp_norm = score_clamp_norm
 
         spatial_dim = resolution * resolution
         self.num_channels = data_dim // spatial_dim
         if data_dim != self.num_channels * spatial_dim:
-            raise ValueError(f"Data dimension {data_dim} incompatible with resolution {resolution}")
+            raise ValueError(f"data_dim {data_dim} not compatible with resolution {resolution}")
         self.input_shape = (self.num_channels, resolution, resolution)
-
-        self.density_model = StaticGlow(
-            input_shape=self.input_shape,
-            hidden_dim=hidden_size,
-            n_blocks_flow=n_blocks_flow,
-            num_scales=num_scales,
-        )
-        self.dynamics_model = InvertibleNeuralFlow(
-            input_shape=self.input_shape,
-            hidden_dim=hidden_size,
-            n_blocks_flow=n_blocks_flow,
-            num_scales=num_scales,
-        )
-
-        if data_mean is None:
-            data_mean = torch.zeros(data_dim)
-        if data_std is None:
-            data_std = torch.ones(data_dim)
-        self.register_buffer("data_mean", data_mean)
-        self.register_buffer("data_std", data_std)
-
-    def update_normalization(self, mean: Tensor, std: Tensor) -> None:
-        with torch.no_grad():
-            self.data_mean.copy_(mean)
-            self.data_std.copy_(std)
-
-    def normalize(self, x: Tensor) -> Tensor:
-        return (x - self.data_mean) / self.data_std
-
-    def denormalize(self, z: Tensor) -> Tensor:
-        return z * self.data_std + self.data_mean
 
     def _format_time(self, t: Tensor | float, batch_size: int) -> Tensor:
         if not torch.is_tensor(t):
@@ -305,33 +293,79 @@ class DecoupledBridge(nn.Module):
         return x
 
     def sample_initial(self, n_samples: int, device: torch.device | str = "cpu") -> Tensor:
+        """Sample from the initial distribution p_0(x).
+        
+        Args:
+            n_samples: Number of samples
+            device: Device to place samples on
+            
+        Returns:
+            Samples from initial distribution
+        """
         epsilon = torch.randn(n_samples, self.data_dim, device=device)
         epsilon_spatial = spatial_data_conversion(epsilon, self.resolution, to_spatial=True)
-        x0_spatial, _ = self.density_model.inverse(epsilon_spatial)
+        x0_spatial, _ = self.density.model.inverse(epsilon_spatial)
         return spatial_data_conversion(x0_spatial, self.resolution, to_spatial=False)
 
     def transport(self, x0: Tensor, t: Tensor | float) -> Tensor:
+        """Transport initial sample forward in time.
+        
+        Args:
+            x0: Initial samples
+            t: Time(s) at which to evaluate transport
+            
+        Returns:
+            Transported samples x_t
+        """
         t_batch = self._format_time(t, x0.shape[0])
         x0_spatial = spatial_data_conversion(x0, self.resolution, to_spatial=True)
-        xt_spatial, _ = self.dynamics_model.forward(x0_spatial, t_batch)
+        xt_spatial, _ = self.dynamics.forward(x0_spatial, t_batch)
         return spatial_data_conversion(xt_spatial, self.resolution, to_spatial=False)
 
     def inverse_transport(self, xt: Tensor, t: Tensor | float) -> Tensor:
+        """Reverse-transport samples backward in time.
+        
+        Args:
+            xt: Samples at time t
+            t: Time(s) at which samples exist
+            
+        Returns:
+            Initial samples x_0
+        """
         t_batch = self._format_time(t, xt.shape[0])
         xt_spatial = spatial_data_conversion(xt, self.resolution, to_spatial=True)
-        x0_spatial, _ = self.dynamics_model.inverse(xt_spatial, t_batch)
+        x0_spatial, _ = self.dynamics.inverse(xt_spatial, t_batch)
         return spatial_data_conversion(x0_spatial, self.resolution, to_spatial=False)
 
     def log_prob_initial(self, x0: Tensor) -> Tensor:
-        x0_spatial = spatial_data_conversion(x0, self.resolution, to_spatial=True)
-        return self.density_model.log_prob(x0_spatial)
+        """Compute log probability under initial distribution.
+        
+        Delegates to DensityWrapper which handles normalization and Jacobian correction.
+        
+        Args:
+            x0: Initial samples
+            
+        Returns:
+            Log probabilities
+        """
+        x0_flat = x0.view(x0.shape[0], -1)
+        return self.density.log_prob(x0_flat)
 
     def log_prob_pushforward(self, xt: Tensor, t: Tensor | float) -> Tensor:
+        """Compute log probability under pushforward distribution at time t.
+        
+        Args:
+            xt: Samples at time t
+            t: Time(s)
+            
+        Returns:
+            Log probabilities
+        """
         t_batch = self._format_time(t, xt.shape[0])
         xt_spatial = spatial_data_conversion(xt, self.resolution, to_spatial=True)
-        x0_spatial, log_det_inv = self.dynamics_model.inverse(xt_spatial, t_batch)
-        log_p0 = self.density_model.log_prob(x0_spatial)
-        return log_p0 + log_det_inv
+        x0_spatial, log_det_inv = self.dynamics.inverse(xt_spatial, t_batch)
+        log_p0_spatial = self.density.model.log_prob(x0_spatial)
+        return log_p0_spatial + log_det_inv
 
     def forward_velocity(self, xt: Tensor, t: Tensor | float) -> Tensor:
         t_batch = self._format_time(t, xt.shape[0])
@@ -391,3 +425,7 @@ class DecoupledBridge(nn.Module):
         mu = self.data_mean.unsqueeze(0).expand(batch, -1).to(device)
         gamma = torch.ones_like(mu)
         return mu, gamma
+
+
+# Backward compatibility alias
+DecoupledBridge = TransportBridge

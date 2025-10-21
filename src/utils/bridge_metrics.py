@@ -90,13 +90,123 @@ def relative_covariance_frobenius_distance(target_cov: torch.Tensor, generated_c
     return (diff_norm / target_norm).item()
 
 
+def compute_sample_correlation_matrix(samples: torch.Tensor) -> torch.Tensor:
+    """Compute the sample correlation matrix (normalized covariance) for a batch of samples.
+    
+    Args:
+        samples: Tensor of shape [N, D] containing N samples of dimension D
+        
+    Returns:
+        Correlation matrix of shape [D, D] with values in [-1, 1]
+    """
+    if samples.dim() != 2:
+        raise ValueError("Correlation matrix expects input with shape [N, D]")
+    
+    # Compute covariance first
+    cov = compute_sample_covariance_matrix(samples)
+    
+    # Extract standard deviations from diagonal
+    std = torch.sqrt(torch.diagonal(cov).clamp(min=1e-8))
+    
+    # Normalize by outer product of std
+    # corr[i,j] = cov[i,j] / (std[i] * std[j])
+    correlation = cov / (std.unsqueeze(1) * std.unsqueeze(0))
+    
+    # Clamp to [-1, 1] to handle numerical errors
+    correlation = torch.clamp(correlation, min=-1.0, max=1.0)
+    
+    return correlation
+
+
+def compute_sample_correlation_matrix_with_eigen(
+    samples: torch.Tensor,
+    truncate: bool = False,
+    variance_threshold: float = 0.999,
+) -> Tuple[torch.Tensor, dict]:
+    """Compute correlation matrix and its eigendecomposition.
+    
+    Args:
+        samples: Tensor of shape [N, D] containing N samples
+        truncate: If True, truncate eigenvalues to variance threshold
+        variance_threshold: Variance threshold for truncation (default: 99.9%)
+        
+    Returns:
+        Tuple of (correlation_matrix, eigen_info_dict)
+        
+    eigen_info_dict contains:
+        - eigenvalues: Sorted eigenvalues in descending order
+        - eigenvectors: Corresponding eigenvectors
+        - variance_ratio: Cumulative variance explained ratio
+        - n_components: Number of components needed for threshold
+    """
+    if samples.dim() != 2:
+        raise ValueError("Expected samples with shape [N, D]")
+    
+    # Compute correlation matrix
+    correlation = compute_sample_correlation_matrix(samples)
+    
+    # Eigendecomposition
+    eigenvalues, eigenvectors = torch.linalg.eigh(correlation)
+    
+    # Sort in descending order
+    sorted_indices = torch.argsort(eigenvalues, descending=True)
+    eigenvalues = eigenvalues[sorted_indices]
+    eigenvectors = eigenvectors[:, sorted_indices]
+    
+    # Clamp negative eigenvalues to zero (due to numerical errors in eigendecomposition)
+    eigenvalues = torch.clamp(eigenvalues, min=0.0)
+    
+    # Compute variance (explained variance ratio)
+    total_variance = eigenvalues.sum().clamp(min=1e-8)
+    variance_ratio = eigenvalues / total_variance
+    cumsum_variance = torch.cumsum(variance_ratio, dim=0)
+    
+    # Find number of components for threshold
+    n_components = (cumsum_variance < variance_threshold).sum().item() + 1
+    n_components = min(n_components, len(eigenvalues))
+    
+    eigen_info = {
+        "eigenvalues": eigenvalues,
+        "eigenvectors": eigenvectors,
+        "variance_ratio": cumsum_variance,
+        "n_components": n_components,
+    }
+    
+    if truncate:
+        # Return only truncated eigenvalues
+        eigenvalues_trunc = eigenvalues[:n_components]
+        return correlation, {
+            "eigenvalues": eigenvalues_trunc,
+            "eigenvectors": eigenvectors[:, :n_components],
+            "variance_ratio": cumsum_variance[:n_components],
+            "n_components": n_components,
+        }
+    
+    return correlation, eigen_info
+
+
 def calculate_validation_metrics(
     target_marginals: TensorDict,
     generated_marginals: TensorDict,
     resolution: int,
     num_projections: int = 128,
 ) -> Dict[str, Dict[float, float]]:
-    """Compute quantitative validation metrics for each marginal time."""
+    """Compute quantitative validation metrics for each marginal time.
+    
+    IMPORTANT: Metrics are computed in the data space of the input tensors.
+    If inputs are normalized (z-space from datamodule), metrics reflect performance
+    in normalized space. For interpretation in original data space (x), multiply
+    distances by the scale of normalization (data_std).
+    
+    Args:
+        target_marginals: Dictionary mapping times to target sample tensors (normalized)
+        generated_marginals: Dictionary mapping times to generated sample tensors (normalized)
+        resolution: Spatial resolution for ACF computation (assumes square: resolution x resolution)
+        num_projections: Number of random projections for sliced Wasserstein
+        
+    Returns:
+        Dictionary with metrics per time and summary statistics
+    """
     shared_times = sorted(set(target_marginals.keys()) & set(generated_marginals.keys()))
     if not shared_times:
         raise ValueError("No overlapping time points between target and generated marginals")

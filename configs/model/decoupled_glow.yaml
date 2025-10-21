@@ -1,16 +1,35 @@
 _target_: src.models.decoupled_glow_module.DecoupledGlowLitModule
 
 bridge:
-  _target_: src.models.components.decoupled_glow.DecoupledBridge
-  data_dim: 1024              # override per dataset if needed
-  hidden_size: 64
-  resolution: 32
-  n_blocks_flow: 2
-  num_scales: 2
-  T: ${data.T}
-  sigma_reverse: 0.5
-  training_noise_std: 0.0001
-  score_clamp_norm: 100.0
+  # Separate model definitions for dependency injection
+  density_model:
+    _target_: src.models.components.decoupled_glow.StaticGlow
+    input_shape:  # [channels, height, width] - override per dataset
+      - 1
+      - 32
+      - 32
+    hidden_dim: 64
+    n_blocks_flow: 2
+    num_scales: 2
+  
+  dynamics_model:
+    _target_: src.models.components.decoupled_glow.InvertibleNeuralFlow
+    input_shape:  # [channels, height, width] - override per dataset
+      - 1
+      - 32
+      - 32
+    hidden_dim: 64
+    n_blocks_flow: 2
+    num_scales: 2
+  
+  # Bridge parameters (not sub-configs)
+  params:
+    data_dim: 1024              # override per dataset if needed
+    resolution: 32
+    T: ${data.T}
+    sigma_reverse: 0.5
+    training_noise_std: 0.0001
+    score_clamp_norm: 100.0
 
 optimizer:
   _target_: torch.optim.Adam
